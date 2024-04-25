@@ -1,0 +1,201 @@
+/* Step 1: Import the CSV file */
+FILENAME REFFILE '/home/u63340110/sasuser.v94/OnlineRetailf.csv';
+
+PROC IMPORT DATAFILE=REFFILE DBMS=CSV OUT=WORK.IMPORT REPLACE;
+    GETNAMES=YES;
+RUN;
+
+/* Check if import was successful */
+%macro check_import;
+    %if &SYSERR ne 0 %then
+        %do;
+            %put ERROR: Import unsuccessful. Check SAS Log for details.;
+        %end;
+    %else
+        %do;
+            %put Import successful.;
+        %end;
+%mend;
+
+/* Step 2: Preprocess the data */
+/* Drop unnecessary columns */
+data df;
+    set WORK.IMPORT;
+
+    /* Assuming the dataset name after import is WORK.IMPORT */
+    drop StockCode Description;
+run;
+
+/* Drop rows with missing values */
+data df_dropna;
+    set df;
+    where not missing(CustomerID);
+run;
+
+/* Convert InvoiceDate to separate year, month, and day variables */
+data df_dropna;
+    set df_dropna;
+    Year=year(InvoiceDate);
+    Month=month(InvoiceDate);
+    Day=day(InvoiceDate);
+
+    /* Ensure UnitPrice and Quantity are positive */
+    if UnitPrice < 0 then UnitPrice = -1 * UnitPrice;
+    if Quantity < 0 then Quantity = -1 * Quantity;
+run;
+
+/* Step 3: Calculate RFM metrics */
+/* Find the last transaction date for each customer */
+proc sql;
+    create table last_transaction_date as 
+        select CustomerID, max(InvoiceDate) as LastTransactionDate format=date9.
+        from df_dropna group by CustomerID;
+quit;
+
+/* Set reference date */
+%let reference_date = '30DEC2011'd;
+
+/* Calculate Recency */
+data RFM;
+    set last_transaction_date;
+
+    /* Calculate Recency by finding the difference between the LastTransactionDate and the reference date */
+    Recency=intck('day', LastTransactionDate, &reference_date.);
+    format Recency Best.;
+run;
+
+/* Calculate Frequency by counting the distinct number of invoices */
+proc sql;
+    create table Frequency as 
+        select CustomerID, count(InvoiceDate) as Frequency 
+        from df_dropna group by CustomerID;
+quit;
+
+/* Calculate MonetaryValue as the sum of Quantity * UnitPrice for each customer */
+proc sql;
+    create table MonetaryValue as 
+        select CustomerID, sum(Quantity * UnitPrice) as MonetaryValue 
+        from df_dropna group by CustomerID;
+quit;
+
+/* Merge Recency, Frequency, and MonetaryValue */
+data RFM;
+    merge RFM Frequency MonetaryValue;
+    by CustomerID;
+run;
+
+/* Step 4: Segment customers based on RFM scores */
+/* For simplicity, let's segment customers based on Recency, Frequency, and MonetaryValue quintiles */
+proc rank data=RFM out=RFM_ranked groups=6 ties=low;
+    var Recency Frequency MonetaryValue;
+    ranks R_Quartile F_Quartile M_Quartile;
+run;
+
+/* Combine quartile ranks to create RFM segments */
+data RFM_segments;
+    set RFM_ranked;
+    drop LastTransactionDate;
+
+    /* Remove LastTransactionDate from the output */
+    /* Assign segment labels based on RFM scores */
+    length RFM_Segment $50.;
+
+    if M_Quartile in (5, 4) and F_Quartile in (5, 4) and R_Quartile in (5, 4) then
+        RFM_Segment='Champions';
+    else if M_Quartile in (5, 4) and F_Quartile in (5, 4) then
+        RFM_Segment='Loyal Accounts';
+    else if R_Quartile in (5, 4) and M_Quartile in (3, 2, 1) then
+        RFM_Segment='Lost';
+    else if R_Quartile in (5, 4) and M_Quartile in (4, 3, 2, 1) then
+        RFM_Segment='At Risk';
+    else if R_Quartile in (5, 4) and M_Quartile=0 then
+        RFM_Segment='About to Sleep';
+    else if R_Quartile in (5, 4) and F_Quartile=0 then
+        RFM_Segment='Potential Loyalist';
+    else if M_Quartile=0 then
+        RFM_Segment='Low Spenders';
+    else if R_Quartile=0 then
+        RFM_Segment='New Active Accounts';
+    else if F_Quartile=0 then
+        RFM_Segment='Promising';
+    else
+        RFM_Segment='Need Attention';
+run;
+
+/* Step 5: Output the results */
+proc print data=RFM_segments;
+    title 'RFM Segmentation Results';
+
+    /* Step 6: Create charts to visualize the count of RFM segments */
+    /* Sort RFM segments by count */
+proc freq data=RFM_segments;
+    tables RFM_Segment / out=RFM_segments_freq(keep=RFM_Segment Count Percent);
+run;
+
+/* Create a bar chart */
+proc sgplot data=RFM_segments_freq;
+    vbar RFM_Segment / response=Count grouporder=data datalabel;
+    yaxis grid;
+    xaxis display=(nolabel) discreteorder=data;
+    title 'Count of RFM Segments';
+run;
+
+/* Step 7: More Visualizations and Summary Statistics */
+/* Summary statistics for Recency, Frequency, and MonetaryValue */
+proc means data=RFM;
+    var Recency Frequency MonetaryValue;
+run;
+
+/* Univariate analysis for Recency, Frequency, and MonetaryValue */
+proc univariate data=RFM;
+    var Recency Frequency MonetaryValue;
+    histogram / normal;
+    inset n mean std min max / position=ne;
+run;
+/* Step 7: More Visualizations and Summary Statistics */
+
+/* Scatter plot between Recency and MonetaryValue */
+proc sgplot data=RFM;
+    title 'Scatter Plot: Recency vs MonetaryValue';
+    scatter x=Recency y=MonetaryValue / markerattrs=(symbol=circlefilled color=red);
+    xaxis label='Recency';
+    yaxis label='MonetaryValue';
+run;
+
+/* Create a colorful bar chart for Country distribution */
+
+proc sgplot data=df_dropna;
+    title 'Country Distribution';
+    vbar Country / response=Count group=Country 
+        datalabel datalabelattrs=(size=9) 
+        barwidth=0.7 fillattrs=(color=red);
+    xaxis display=(nolabel) discreteorder=data;
+    yaxis grid label='Count';
+run;
+
+/* Box plot for Frequency */
+proc sgplot data=RFM;
+    title 'Box Plot: Frequency';
+    vbox Frequency / category=F_Quartile fillattrs=(color=red);
+    xaxis label='Frequency Quartile';
+    yaxis label='Frequency';
+run;
+
+/* Correlation matrix */
+proc corr data=RFM spearman;
+    var Recency Frequency MonetaryValue;
+    title 'Correlation Matrix';
+    
+proc sql;
+    select count(distinct CustomerID) as NumUniqueCustomers
+    from df_dropna;
+quit;
+
+run;
+/* RFM Segmentation Results CSV */
+proc export data=RFM_segments
+    outfile='/home/u63340110/RFM_Segmentation_Results.csv'
+    dbms=csv
+    replace;
+    label;
+run;
